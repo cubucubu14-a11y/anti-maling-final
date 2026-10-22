@@ -148,7 +148,7 @@ class TheftService : Service(), SensorEventListener {
                 stillStartTime = 0L
                 if (state == State.ARMING) {
                     state = State.WAITING
-                    updateNotification("Mode Siaga", "$debugText | Goyang: ${linearAcc.toFixed(1)}", false)
+                    updateNotification("Mode Siaga", "$debugText | Goyang: ${String.format("%.1f", linearAcc)}", false)
                 }
             }
         }
