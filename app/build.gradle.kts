@@ -1,26 +1,35 @@
-plugins { id("com.android.application") 
+plugins {
+    id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
-android { namespace = "com.antitheft.guard" 
-    compileSdk = 34 defaultConfig {
-        applicationId = "com.antitheft.guard" 
-        minSdk = 24 targetSdk = 34 versionCode 
-        = 1 versionName = "1.0"
+
+android {
+    namespace = "com.antitheft.guard"
+    compileSdk = 34
+
+    defaultConfig {
+        applicationId = "com.antitheft.guard"
+        minSdk = 24
+        targetSdk = 34
+        versionCode = 1
+        versionName = "1.0"
     }
-    buildTypes { release { isMinifyEnabled = 
-            false
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
         }
     }
-    compileOptions { sourceCompatibility = 
-        JavaVersion.VERSION_17 
-        targetCompatibility = 
-        JavaVersion.VERSION_17
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions { jvmTarget = "17"
+    kotlinOptions {
+        jvmTarget = "17"
     }
-}
-dependencies { 
-    implementation("androidx.core:core-ktx:1.12.0") 
-    implementation("androidx.appcompat:appcompat:1.6.1")
 }
 
+dependencies {
+    implementation("androidx.core:core-ktx:1.12.0")
+    implementation("androidx.appcompat:appcompat:1.6.1")
+}
