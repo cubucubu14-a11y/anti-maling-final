@@ -1,4 +1,7 @@
-name: Build Anti-Theft APK
+name: Build Anti-Theft APKnano .github/workflows/build.yml
+
+
+
 
 on:
   push:
@@ -17,16 +20,11 @@ jobs:
       uses: actions/setup-java@v4
       with:
         java-version: '17'
-        distribution: 'temurin'
-
-    - name: Setup Gradle
+        distribut   - name: Setup Gradle
       uses: gradle/actions/setup-gradle@v3
 
     - name: Build Debug APK
       run: gradle assembleDebug
 
     - name: Upload APK Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: Anti-Theft-App
-        path: app/build/outputs/apk/debug/app-debug.apk
+      uses: actions/upload-artifact@
