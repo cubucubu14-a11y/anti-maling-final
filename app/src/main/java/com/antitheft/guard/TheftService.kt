@@ -72,7 +72,7 @@ class TheftService : Service(), SensorEventListener {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(1, buildNotification("Mode Siaga", "Menunggu HP diletakkan datar...", false))
+        startForeground(1, buildNotification("Mode Siaga", "Mendengarkan sensor...", false))
         
         if (wakeLock?.isHeld == false) {
             wakeLock?.acquire(12 * 60 * 60 * 1000L)
@@ -90,16 +90,19 @@ class TheftService : Service(), SensorEventListener {
     override fun onSensorChanged(event: SensorEvent?) {
         if (event == null || state == State.TRIGGERED || state == State.ALARM) return
 
-        // FITUR BARU: Jika layar sedang menyala (HP sedang dipakai), abaikan gerakan!
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        if (pm.isInteractive) {
-            // Jika layar menyala, kita anggap aman (pemilik sedang pakai HP)
+        
+        // --- TAMPILKAN DEBUG DI NOTIFIKASI ---
+        val isScreenOn = pm.isInteractive
+        val debugText = if (isScreenOn) "Layar Nyala (Abaikan)" else "Layar Mati (Aktif)"
+        
+        // Jika layar menyala, jangan hitung skor
+        if (isScreenOn) {
             if (state == State.ARMED) {
-                // Kembalikan ke mode tunggu (karena HP sedang dipegang)
                 state = State.WAITING
                 motionScore = 0f
-                updateNotification("Mode Siaga", "HP sedang dipakai. Menunggu diletakkan...", false)
             }
+            updateNotification("Mode Siaga", "$debugText | Skor: 0.0", false)
             return
         }
 
@@ -133,19 +136,19 @@ class TheftService : Service(), SensorEventListener {
                 if (elapsed > 500) {
                     state = State.ARMING
                     val remaining = ceil((AUTO_ARM_DELAY - elapsed) / 1000.0).toInt()
-                    updateNotification("AUTO-ARMING", "Mengunci dalam $remaining detik...", false)
+                    updateNotification("AUTO-ARMING", "$debugText | Mengunci: $remaining s", false)
                 }
                 if (elapsed >= AUTO_ARM_DELAY) {
                     state = State.ARMED
                     baseRoll = roll; basePitch = pitch
                     stillStartTime = 0L; motionScore = 0f
-                    updateNotification("🛡️ SIAGA (ARMED)", "HP diamankan. Jangan diangkat.", false)
+                    updateNotification("🛡️ SIAGA (ARMED)", "$debugText | Skor: 0.0", false)
                 }
             } else {
                 stillStartTime = 0L
                 if (state == State.ARMING) {
                     state = State.WAITING
-                    updateNotification("Mode Siaga", "Menunggu HP diletakkan datar...", false)
+                    updateNotification("Mode Siaga", "$debugText | Goyang: ${linearAcc.toFixed(1)}", false)
                 }
             }
         }
@@ -162,6 +165,9 @@ class TheftService : Service(), SensorEventListener {
 
             if (motionScore < 0) motionScore = 0f
             if (motionScore > SCORE_LIMIT) motionScore = SCORE_LIMIT
+            
+            // TAMPILKAN SKOR KE NOTIFIKASI
+            updateNotification("🛡️ SIAGA (ARMED)", "$debugText | Skor: ${motionScore.toFixed(1)}", false)
 
             if (motionScore >= SCORE_LIMIT) {
                 triggerTimer()
@@ -181,13 +187,13 @@ class TheftService : Service(), SensorEventListener {
         )
         screenWakeLock?.acquire(10000L)
 
-        updateNotification("⚠️ PERINGATAN!", "Buka kunci HP dalam 4 detik atau sirine berbunyi!", true)
+        updateNotification("⚠️ PERINGATAN!", "Buka kunci HP dalam 4 detik!", true)
         handler?.postDelayed({ if (isTriggered) triggerAlarm() }, COUNTDOWN_SECONDS)
     }
 
     private fun triggerAlarm() {
         state = State.ALARM
-        updateNotification("🚨 ALARM! 🚨", "HP diambil orang lain! Buka kunci HP untuk mematikan.", true)
+        updateNotification("🚨 ALARM! 🚨", "HP diambil orang lain!", true)
         
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         audioManager.setStreamVolume(AudioManager.STREAM_ALARM, audioManager.getStreamMaxVolume(AudioManager.STREAM_ALARM), 0)
