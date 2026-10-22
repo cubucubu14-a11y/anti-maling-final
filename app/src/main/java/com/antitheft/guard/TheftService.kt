@@ -42,19 +42,15 @@ class TheftService : Service(), SensorEventListener {
     private var handler: Handler? = null
     private var mediaPlayer: MediaPlayer? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var screenWakeLock: PowerManager.WakeLock? = null
     private var isTriggered = false
     private var watchdogRunnable: Runnable? = null
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            when (intent?.action) {
-                Intent.ACTION_SCREEN_ON -> {
-                    if (state == State.ARMED) hasLastData = false 
-                }
-                Intent.ACTION_USER_PRESENT -> {
-                    if (isTriggered || mediaPlayer != null || state == State.TRIGGERED || state == State.ALARM) {
-                        stopAlarmAndReset("Dibuka oleh pemilik")
-                    }
+            if (intent?.action == Intent.ACTION_USER_PRESENT) {
+                if (isTriggered || mediaPlayer != null || state == State.TRIGGERED || state == State.ALARM) {
+                    stopAlarmAndReset("Dibuka oleh pemilik")
                 }
             }
         }
@@ -65,10 +61,7 @@ class TheftService : Service(), SensorEventListener {
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         
-        val filter = IntentFilter().apply {
-            addAction(Intent.ACTION_SCREEN_ON)
-            addAction(Intent.ACTION_USER_PRESENT)
-        }
+        val filter = IntentFilter(Intent.ACTION_USER_PRESENT)
         registerReceiver(screenReceiver, filter)
 
         createNotificationChannel()
@@ -96,6 +89,19 @@ class TheftService : Service(), SensorEventListener {
 
     override fun onSensorChanged(event: SensorEvent?) {
         if (event == null || state == State.TRIGGERED || state == State.ALARM) return
+
+        // FITUR BARU: Jika layar sedang menyala (HP sedang dipakai), abaikan gerakan!
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (pm.isInteractive) {
+            // Jika layar menyala, kita anggap aman (pemilik sedang pakai HP)
+            if (state == State.ARMED) {
+                // Kembalikan ke mode tunggu (karena HP sedang dipegang)
+                state = State.WAITING
+                motionScore = 0f
+                updateNotification("Mode Siaga", "HP sedang dipakai. Menunggu diletakkan...", false)
+            }
+            return
+        }
 
         val acc = event.values
         if (gX == 0f && gY == 0f && gZ == 0f || !hasLastData) {
@@ -166,6 +172,15 @@ class TheftService : Service(), SensorEventListener {
     private fun triggerTimer() {
         state = State.TRIGGERED
         isTriggered = true
+        
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        @Suppress("DEPRECATION")
+        screenWakeLock = pm.newWakeLock(
+            PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+            "AntiTheft::ScreenWakeLock"
+        )
+        screenWakeLock?.acquire(10000L)
+
         updateNotification("⚠️ PERINGATAN!", "Buka kunci HP dalam 4 detik atau sirine berbunyi!", true)
         handler?.postDelayed({ if (isTriggered) triggerAlarm() }, COUNTDOWN_SECONDS)
     }
@@ -248,6 +263,8 @@ class TheftService : Service(), SensorEventListener {
         
         mediaPlayer?.stop(); mediaPlayer?.release(); mediaPlayer = null
         watchdogRunnable?.let { handler?.removeCallbacks(it) }
+        
+        if (screenWakeLock?.isHeld == true) screenWakeLock?.release()
 
         val vibrator = if (Build.VERSION.SDK_INT >= 31) {
             (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
@@ -270,6 +287,7 @@ class TheftService : Service(), SensorEventListener {
         mediaPlayer?.release()
         watchdogRunnable?.let { handler?.removeCallbacks(it) }
         if (wakeLock?.isHeld == true) wakeLock?.release()
+        if (screenWakeLock?.isHeld == true) screenWakeLock?.release()
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
