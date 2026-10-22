@@ -64,7 +64,7 @@ class TheftService : Service(), SensorEventListener {
         createNotificationChannel()
         handler = Handler(Looper.getMainLooper())
         
-        // Kunci CPU agar tetap bangun
+        // PERBAIKAN: Siapkan WakeLock agar CPU bangun saat layar mati
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AntiTheft::WakeLock")
     }
@@ -72,14 +72,14 @@ class TheftService : Service(), SensorEventListener {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(1, buildNotification("Mode Siaga", "Menunggu HP diletakkan datar..."))
         
-        // Tahan CPU tetap bangun maksimal 12 jam
+        // PERBAIKAN: Kunci CPU selama 12 jam
         if (wakeLock?.isHeld == false) {
             wakeLock?.acquire(12 * 60 * 60 * 1000L)
         }
 
         resetToWaiting()
         
-        // Daftarkan sensor
+        // PERBAIKAN: Daftarkan sensor
         accelerometer?.let { 
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) 
         }
