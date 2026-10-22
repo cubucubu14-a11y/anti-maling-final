@@ -21,15 +21,10 @@ class TheftService : Service(), SensorEventListener {
     private lateinit var sensorManager: SensorManager
     private var accelerometer: Sensor? = null
 
-    private var gX = 0f
-    private var gY = 0f
-    private var gZ = 0f
-    private var lastX = 0f
-    private var lastY = 0f
-    private var lastZ = 0f
+    private var gX = 0f; private var gY = 0f; private var gZ = 0f
+    private var lastX = 0f; private var lastY = 0f; private var lastZ = 0f
     private var hasLastData = false
-    private var baseRoll = 0f
-    private var basePitch = 0f
+    private var baseRoll = 0f; private var basePitch = 0f
 
     private enum class State { WAITING, ARMING, ARMED, TRIGGERED, ALARM }
     private var state = State.WAITING
@@ -46,7 +41,6 @@ class TheftService : Service(), SensorEventListener {
     private var mediaPlayer: MediaPlayer? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var isTriggered = false
-
     private var watchdogRunnable: Runnable? = null
 
     private val screenReceiver = object : BroadcastReceiver() {
@@ -69,17 +63,26 @@ class TheftService : Service(), SensorEventListener {
 
         createNotificationChannel()
         handler = Handler(Looper.getMainLooper())
+        
+        // Kunci CPU agar tetap bangun
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AntiTheft::WakeLock")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(1, buildNotification("Mode Siaga", "Menunggu HP diletakkan datar..."))
         
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AntiTheft::WakeLock")
-        wakeLock?.acquire(10*60*1000L)
+        // Tahan CPU tetap bangun maksimal 12 jam
+        if (wakeLock?.isHeld == false) {
+            wakeLock?.acquire(12 * 60 * 60 * 1000L)
+        }
 
         resetToWaiting()
-        accelerometer?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+        
+        // Daftarkan sensor
+        accelerometer?.let { 
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) 
+        }
         
         return START_STICKY
     }
@@ -88,7 +91,6 @@ class TheftService : Service(), SensorEventListener {
         if (event == null || state == State.TRIGGERED || state == State.ALARM) return
 
         val acc = event.values
-
         if (gX == 0f && gY == 0f && gZ == 0f) {
             gX = acc[0]; gY = acc[1]; gZ = acc[2]
         } else {
@@ -99,14 +101,11 @@ class TheftService : Service(), SensorEventListener {
 
         val roll = Math.toDegrees(atan2(gX.toDouble(), gZ.toDouble())).toFloat()
         val pitch = Math.toDegrees(atan2(gY.toDouble(), sqrt((gX*gX + gZ*gZ).toDouble()))).toFloat()
-        
         val isFlat = abs(gZ) > 7.0f
 
         var linearAcc = 0f
         if (hasLastData) {
-            val dx = acc[0] - lastX
-            val dy = acc[1] - lastY
-            val dz = acc[2] - lastZ
+            val dx = acc[0] - lastX; val dy = acc[1] - lastY; val dz = acc[2] - lastZ
             linearAcc = sqrt(dx*dx + dy*dy + dz*dz)
         }
         lastX = acc[0]; lastY = acc[1]; lastZ = acc[2]; hasLastData = true
@@ -114,20 +113,17 @@ class TheftService : Service(), SensorEventListener {
         if (state == State.WAITING || state == State.ARMING) {
             if (isFlat && linearAcc < 0.5f) {
                 if (stillStartTime == 0L) stillStartTime = System.currentTimeMillis()
-                
                 val elapsed = System.currentTimeMillis() - stillStartTime
+                
                 if (elapsed > 500) {
                     state = State.ARMING
                     val remaining = ceil((AUTO_ARM_DELAY - elapsed) / 1000.0).toInt()
                     updateNotification("AUTO-ARMING", "Mengunci dalam $remaining detik...")
                 }
-
                 if (elapsed >= AUTO_ARM_DELAY) {
                     state = State.ARMED
-                    baseRoll = roll
-                    basePitch = pitch
-                    stillStartTime = 0L
-                    motionScore = 0f
+                    baseRoll = roll; basePitch = pitch
+                    stillStartTime = 0L; motionScore = 0f
                     updateNotification("🛡️ SIAGA (ARMED)", "HP diamankan. Jangan diangkat.")
                 }
             } else {
@@ -141,7 +137,6 @@ class TheftService : Service(), SensorEventListener {
 
         if (state == State.ARMED) {
             val tiltDiff = abs(roll - baseRoll) + abs(pitch - basePitch)
-
             if (tiltDiff > TILT_THRESHOLD || linearAcc > MOTION_THRESHOLD) {
                 motionScore += 2.0f
             } else if (linearAcc > 0.8f) {
@@ -163,12 +158,7 @@ class TheftService : Service(), SensorEventListener {
         state = State.TRIGGERED
         isTriggered = true
         updateNotification("⚠️ PERINGATAN!", "Buka kunci HP dalam 4 detik atau sirine berbunyi!")
-
-        handler?.postDelayed({
-            if (isTriggered) {
-                triggerAlarm()
-            }
-        }, COUNTDOWN_SECONDS)
+        handler?.postDelayed({ if (isTriggered) triggerAlarm() }, COUNTDOWN_SECONDS)
     }
 
     private fun triggerAlarm() {
@@ -190,14 +180,12 @@ class TheftService : Service(), SensorEventListener {
         val vibrator = if (Build.VERSION.SDK_INT >= 31) {
             (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
         } else {
-            @Suppress("DEPRECATION")
-            getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+            @Suppress("DEPRECATION") getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
         }
         if (Build.VERSION.SDK_INT >= 26) {
             vibrator.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 500, 500), 0))
         } else {
-            @Suppress("DEPRECATION")
-            vibrator.vibrate(longArrayOf(0, 500, 500), 0)
+            @Suppress("DEPRECATION") vibrator.vibrate(longArrayOf(0, 500, 500), 0)
         }
 
         startVolumeWatchdog()
@@ -206,7 +194,6 @@ class TheftService : Service(), SensorEventListener {
     private fun startVolumeWatchdog() {
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_ALARM)
-        
         watchdogRunnable = object : Runnable {
             override fun run() {
                 if (state == State.ALARM) {
@@ -221,36 +208,24 @@ class TheftService : Service(), SensorEventListener {
     }
 
     private fun stopAlarmAndReset(reason: String) {
-        isTriggered = false
-        state = State.WAITING
-        motionScore = 0f
-        stillStartTime = 0L
-        hasLastData = false
+        isTriggered = false; state = State.WAITING
+        motionScore = 0f; stillStartTime = 0L; hasLastData = false
         gX = 0f; gY = 0f; gZ = 0f
         
-        mediaPlayer?.stop()
-        mediaPlayer?.release()
-        mediaPlayer = null
-
+        mediaPlayer?.stop(); mediaPlayer?.release(); mediaPlayer = null
         watchdogRunnable?.let { handler?.removeCallbacks(it) }
-        watchdogRunnable = null
-
+        
         val vibrator = if (Build.VERSION.SDK_INT >= 31) {
             (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
         } else {
-            @Suppress("DEPRECATION")
-            getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+            @Suppress("DEPRECATION") getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
         }
         vibrator.cancel()
-
         updateNotification("Aman", reason)
     }
 
     private fun resetToWaiting() {
-        state = State.WAITING
-        motionScore = 0f
-        stillStartTime = 0L
-        hasLastData = false
+        state = State.WAITING; motionScore = 0f; stillStartTime = 0L; hasLastData = false
         gX = 0f; gY = 0f; gZ = 0f
     }
 
@@ -274,12 +249,9 @@ class TheftService : Service(), SensorEventListener {
 
     private fun buildNotification(title: String, text: String): Notification {
         return NotificationCompat.Builder(this, "guard_channel")
-            .setContentTitle(title)
-            .setContentText(text)
+            .setContentTitle(title).setContentText(text)
             .setSmallIcon(android.R.drawable.ic_lock_lock)
-            .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .build()
+            .setOngoing(true).setPriority(NotificationCompat.PRIORITY_HIGH).build()
     }
 
     private fun updateNotification(title: String, text: String) {
