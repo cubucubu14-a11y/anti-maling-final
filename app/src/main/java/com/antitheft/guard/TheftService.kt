@@ -72,7 +72,7 @@ class TheftService : Service(), SensorEventListener {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(1, buildNotification("Mode Siaga", "Mendengarkan sensor...", false))
+        startForeground(1, buildNotification("Mode Siaga", "Menunggu HP diletakkan datar...", false))
         
         if (wakeLock?.isHeld == false) {
             wakeLock?.acquire(12 * 60 * 60 * 1000L)
@@ -90,19 +90,14 @@ class TheftService : Service(), SensorEventListener {
     override fun onSensorChanged(event: SensorEvent?) {
         if (event == null || state == State.TRIGGERED || state == State.ALARM) return
 
+        // Jika layar sedang menyala (HP sedang dipakai), abaikan gerakan
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        
-        // --- TAMPILKAN DEBUG DI NOTIFIKASI ---
-        val isScreenOn = pm.isInteractive
-        val debugText = if (isScreenOn) "Layar Nyala (Abaikan)" else "Layar Mati (Aktif)"
-        
-        // Jika layar menyala, jangan hitung skor
-        if (isScreenOn) {
+        if (pm.isInteractive) {
             if (state == State.ARMED) {
                 state = State.WAITING
                 motionScore = 0f
+                updateNotification("Mode Siaga", "HP sedang dipakai. Menunggu diletakkan...", false)
             }
-            updateNotification("Mode Siaga", "$debugText | Skor: 0.0", false)
             return
         }
 
@@ -136,19 +131,19 @@ class TheftService : Service(), SensorEventListener {
                 if (elapsed > 500) {
                     state = State.ARMING
                     val remaining = ceil((AUTO_ARM_DELAY - elapsed) / 1000.0).toInt()
-                    updateNotification("AUTO-ARMING", "$debugText | Mengunci: $remaining s", false)
+                    updateNotification("AUTO-ARMING", "Mengunci dalam $remaining detik...", false)
                 }
                 if (elapsed >= AUTO_ARM_DELAY) {
                     state = State.ARMED
                     baseRoll = roll; basePitch = pitch
                     stillStartTime = 0L; motionScore = 0f
-                    updateNotification("🛡️ SIAGA (ARMED)", "$debugText | Skor: 0.0", false)
+                    updateNotification("🛡️ SIAGA (ARMED)", "HP diamankan. Jangan diangkat.", false)
                 }
             } else {
                 stillStartTime = 0L
                 if (state == State.ARMING) {
                     state = State.WAITING
-                    updateNotification("Mode Siaga", "$debugText | Goyang: ${String.format("%.1f", linearAcc)}", false)
+                    updateNotification("Mode Siaga", "Menunggu HP diletakkan datar...", false)
                 }
             }
         }
@@ -165,9 +160,6 @@ class TheftService : Service(), SensorEventListener {
 
             if (motionScore < 0) motionScore = 0f
             if (motionScore > SCORE_LIMIT) motionScore = SCORE_LIMIT
-            
-            // TAMPILKAN SKOR KE NOTIFIKASI
-            updateNotification("🛡️ SIAGA (ARMED)", "$debugText | Skor: ${motionScore.toFixed(1)}", false)
 
             if (motionScore >= SCORE_LIMIT) {
                 triggerTimer()
@@ -179,6 +171,16 @@ class TheftService : Service(), SensorEventListener {
         state = State.TRIGGERED
         isTriggered = true
         
+        // 1. PANGGIL LAYAR MERAH (Memaksa layar menyala & menembus kunci)
+        try {
+            val intent = Intent(this, AlarmActivity::class.java)
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            startActivity(intent)
+        } catch (e: Exception) {
+            // Abaikan jika gagal
+        }
+
+        // 2. WAKE LOCK CADANGAN (Memaksa layar nyala secara Hardware)
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         @Suppress("DEPRECATION")
         screenWakeLock = pm.newWakeLock(
@@ -187,13 +189,16 @@ class TheftService : Service(), SensorEventListener {
         )
         screenWakeLock?.acquire(10000L)
 
+        // 3. Tampilkan Notifikasi
         updateNotification("⚠️ PERINGATAN!", "Buka kunci HP dalam 4 detik!", true)
+        
+        // 4. Hitung mundur
         handler?.postDelayed({ if (isTriggered) triggerAlarm() }, COUNTDOWN_SECONDS)
     }
 
     private fun triggerAlarm() {
         state = State.ALARM
-        updateNotification("🚨 ALARM! 🚨", "HP diambil orang lain!", true)
+        updateNotification("🚨 ALARM! 🚨", "HP diambil orang lain! Buka kunci HP untuk mematikan.", true)
         
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         audioManager.setStreamVolume(AudioManager.STREAM_ALARM, audioManager.getStreamMaxVolume(AudioManager.STREAM_ALARM), 0)
