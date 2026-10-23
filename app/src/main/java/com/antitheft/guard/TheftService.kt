@@ -39,15 +39,29 @@ class TheftService : Service() {
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
+                // Saat HP masuk mode tidur (layar mati total)
                 Intent.ACTION_SCREEN_OFF -> {
                     isArmed = true
                     isTriggered = false
-                    updateNotification("Mode Siaga: Layar Mati. HP siap diamankan.")
+                    updateNotification("Mode Siaga: HP siap diamankan.")
                 }
+                
+                // Saat AOD menyala (HP digerakkan/diangkat) ATAU layar dinyalakan
                 Intent.ACTION_SCREEN_ON -> {
                     if (isArmed && !isAlarmActive && !isTriggered) {
                         isTriggered = true
-                        updateNotification("⚠️ HP Menyala! Buka kunci dalam 4 detik!")
+                        
+                        // PAKSA LAYAR MENYALA TERANG agar CPU bangun!
+                        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                        @Suppress("DEPRECATION")
+                        val screenWake = pm.newWakeLock(
+                            PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                            "AntiTheft::ScreenWake"
+                        )
+                        screenWake.acquire(10000L)
+
+                        updateNotification("⚠️ HP Bergerak! Buka kunci dalam 4 detik!")
+                        
                         handler?.postDelayed({
                             if (isTriggered) {
                                 triggerAlarm()
@@ -55,6 +69,8 @@ class TheftService : Service() {
                         }, COUNTDOWN_SECONDS)
                     }
                 }
+                
+                // Saat HP berhasil di-unlock (Sidik jari / PIN)
                 Intent.ACTION_USER_PRESENT -> {
                     if (isTriggered || isAlarmActive) {
                         stopAlarmAndReset("Aman: Dibuka oleh pemilik")
@@ -101,14 +117,13 @@ class TheftService : Service() {
                 startForegroundCompat(buildNotification("Memantau status layar..."))
                 if (wakeLock.isHeld.not()) wakeLock.acquire(12 * 60 * 60 * 1000L)
                 isArmed = true
-                updateNotification("Mode Siaga: Layar Mati. HP siap diamankan.")
+                updateNotification("Mode Siaga: HP siap diamankan.")
                 startHeartbeat()
             }
         }
         return START_STICKY
     }
 
-    // --- PENGAMAN: Restart otomatis jika di-swipe dari Recent Apps ---
     override fun onTaskRemoved(rootIntent: Intent?) {
         val restartServiceIntent = Intent(applicationContext, TheftService::class.java).apply {
             action = ACTION_START
@@ -132,7 +147,7 @@ class TheftService : Service() {
         heartbeatRunnable?.let { handler?.removeCallbacks(it) }
         heartbeatRunnable = object : Runnable {
             override fun run() {
-                if (!isAlarmActive) {
+                if (!isAlarmActive && !isTriggered) {
                     updateNotification("Sensor aktif (heartbeat OK)")
                 }
                 handler?.postDelayed(this, 10000)
@@ -152,11 +167,6 @@ class TheftService : Service() {
     private fun triggerAlarm() {
         isAlarmActive = true
         isTriggered = false
-
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        @Suppress("DEPRECATION")
-        val screenWake = pm.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP, "AntiTheft::ScreenWake")
-        screenWake.acquire(10000L)
 
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         am.setStreamVolume(AudioManager.STREAM_ALARM, am.getStreamMaxVolume(AudioManager.STREAM_ALARM), 0)
