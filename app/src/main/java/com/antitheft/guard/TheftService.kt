@@ -1,10 +1,13 @@
+
 package com.antitheft.guard
 
-import android.app.*
-import android.content.BroadcastReceiver
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
+import android.content.pm.ServiceInfo
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -13,326 +16,350 @@ import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.MediaPlayer
 import android.media.RingtoneManager
-import android.net.Uri
-import android.os.*
+import android.os.Build
+import android.os.IBinder
+import android.os.PowerManager
+import android.os.SystemClock
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import androidx.core.app.NotificationCompat
-import kotlin.math.*
+import kotlin.math.sqrt
 
 class TheftService : Service(), SensorEventListener {
 
+    companion object {
+        const val ACTION_START = "com.antitheft.guard.START"
+        const val ACTION_STOP = "com.antitheft.guard.STOP"
+
+        private const val CHANNEL_ID = "anti_theft_channel"
+        private const val NOTIFICATION_ID = 2001
+
+        // Ambang lebih rendah khusus untuk pengujian.
+        private const val MOTION_THRESHOLD = 1.5f
+        private const val COOLDOWN_MS = 2500L
+        private const val STATUS_UPDATE_MS = 5000L
+    }
+
     private lateinit var sensorManager: SensorManager
     private var accelerometer: Sensor? = null
-
-    private var gX = 0f; private var gY = 0f; private var gZ = 0f
-    private var lastX = 0f; private var lastY = 0f; private var lastZ = 0f
-    private var hasLastData = false
-    private var baseRoll = 0f; private var basePitch = 0f
-
-    private enum class State { WAITING, ARMING, ARMED, TRIGGERED, ALARM }
-    private var state = State.WAITING
-    
-    private var stillStartTime = 0L
-    private var motionScore = 0f
-    private val TILT_THRESHOLD = 15.0f
-    private val MOTION_THRESHOLD = 2.0f
-    private val SCORE_LIMIT = 30.0f
-    private val AUTO_ARM_DELAY = 5000L
-    private val COUNTDOWN_SECONDS = 4000L
-
-    private var handler: Handler? = null
-    private var mediaPlayer: MediaPlayer? = null
     private var wakeLock: PowerManager.WakeLock? = null
-    private var screenWakeLock: PowerManager.WakeLock? = null
-    private var isTriggered = false
-    private var watchdogRunnable: Runnable? = null
+    private var mediaPlayer: MediaPlayer? = null
+    private var vibrator: Vibrator? = null
 
-    private val screenReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == Intent.ACTION_USER_PRESENT) {
-                if (isTriggered || mediaPlayer != null || state == State.TRIGGERED || state == State.ALARM) {
-                    stopAlarmAndReset("Dibuka oleh pemilik")
-                }
-            }
-        }
-    }
+    private var monitoring = false
+    private var alarmPlaying = false
+    private var gravityInitialized = false
+
+    private var gx = 0f
+    private var gy = 0f
+    private var gz = 0f
+
+    private var lastAlarm = 0L
+    private var lastStatusUpdate = 0L
+    private var sensorEventCount = 0L
 
     override fun onCreate() {
         super.onCreate()
-        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-        accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-        
-        val filter = IntentFilter(Intent.ACTION_USER_PRESENT)
-        registerReceiver(screenReceiver, filter)
+
+        sensorManager =
+            getSystemService(Context.SENSOR_SERVICE) as SensorManager
+
+        accelerometer =
+            sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+
+        val pm = getSystemService(Context.POWER_SERVICE)
+                as PowerManager
+
+        wakeLock = pm.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "$packageName:AntiTheftMotion"
+        )
+
+        vibrator = if (Build.VERSION.SDK_INT >= 31) {
+            (getSystemService(Context.VIBRATOR_MANAGER_SERVICE)
+                    as VibratorManager).defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        }
 
         createNotificationChannel()
-        handler = Handler(Looper.getMainLooper())
-        
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AntiTheft::WakeLock")
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(1, buildNotification("Mode Siaga", "Menunggu HP diletakkan datar...", false))
-        
-        if (wakeLock?.isHeld == false) {
-            wakeLock?.acquire(12 * 60 * 60 * 1000L)
+    override fun onStartCommand(
+        intent: Intent?,
+        flags: Int,
+        startId: Int
+    ): Int {
+        when (intent?.action) {
+            ACTION_STOP -> {
+                stopMonitoring()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+                return START_NOT_STICKY
+            }
+
+            ACTION_START, null -> startMonitoring()
         }
 
-        resetToWaiting()
-        
-        accelerometer?.let { 
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI) 
-        }
-        
         return START_STICKY
     }
 
-    override fun onSensorChanged(event: SensorEvent?) {
-        if (event == null || state == State.TRIGGERED || state == State.ALARM) return
+    private fun startMonitoring() {
+        if (monitoring) return
 
-        // Jika layar sedang menyala (HP sedang dipakai), abaikan gerakan
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        if (pm.isInteractive) {
-            if (state == State.ARMED) {
-                state = State.WAITING
-                motionScore = 0f
-                updateNotification("Mode Siaga", "HP sedang dipakai. Menunggu diletakkan...", false)
-            }
+        if (accelerometer == null) {
+            startForegroundCompat(buildNotification("Sensor akselerometer tidak tersedia"))
+            stopSelf()
             return
         }
 
-        val acc = event.values
-        if (gX == 0f && gY == 0f && gZ == 0f || !hasLastData) {
-            gX = acc[0]; gY = acc[1]; gZ = acc[2]
+        startForegroundCompat(
+            buildNotification("Menyiapkan sensor gerakan...")
+        )
+
+        try {
+            if (wakeLock?.isHeld != true) {
+                wakeLock?.acquire()
+            }
+
+            gravityInitialized = false
+            sensorEventCount = 0L
+            lastAlarm = 0L
+            lastStatusUpdate = 0L
+
+            // Sampling lebih cepat daripada SENSOR_DELAY_NORMAL.
+            // Max report latency 0 agar event tidak sengaja dibuffer.
+            monitoring = sensorManager.registerListener(
+                this,
+                accelerometer,
+                SensorManager.SENSOR_DELAY_GAME,
+                0
+            )
+
+            updateNotification(
+                if (monitoring) {
+                    "Pemantauan aktif — menunggu data sensor"
+                } else {
+                    "Gagal mendaftarkan sensor"
+                }
+            )
+
+            if (!monitoring) {
+                stopMonitoring()
+                stopSelf()
+            }
+        } catch (e: Exception) {
+            updateNotification("Gagal memulai sensor: ${e.javaClass.simpleName}")
+            stopMonitoring()
+            stopSelf()
+        }
+    }
+
+    private fun startForegroundCompat(notification: Notification) {
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            )
         } else {
-            gX = (gX * 0.85f) + (acc[0] * 0.15f)
-            gY = (gY * 0.85f) + (acc[1] * 0.15f)
-            gZ = (gZ * 0.85f) + (acc[2] * 0.15f)
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    override fun onSensorChanged(event: SensorEvent) {
+        if (!monitoring || event.sensor.type != Sensor.TYPE_ACCELEROMETER) {
+            return
         }
 
-        val roll = Math.toDegrees(atan2(gX.toDouble(), gZ.toDouble())).toFloat()
-        val pitch = Math.toDegrees(atan2(gY.toDouble(), sqrt((gX*gX + gZ*gZ).toDouble()))).toFloat()
-        val isFlat = abs(gZ) > 7.0f
+        sensorEventCount++
 
-        var linearAcc = 0f
-        if (hasLastData) {
-            val dx = acc[0] - lastX; val dy = acc[1] - lastY; val dz = acc[2] - lastZ
-            linearAcc = sqrt(dx*dx + dy*dy + dz*dz)
+        val x = event.values[0]
+        val y = event.values[1]
+        val z = event.values[2]
+
+        if (!gravityInitialized) {
+            gx = x
+            gy = y
+            gz = z
+            gravityInitialized = true
+            updateNotification("Sensor menerima data — gerakan belum terdeteksi")
+            return
         }
-        lastX = acc[0]; lastY = acc[1]; lastZ = acc[2]; hasLastData = true
 
+        // Filter gravitasi untuk memperkirakan gerakan perangkat.
+        val alpha = 0.8f
+        gx = alpha * gx + (1f - alpha) * x
+        gy = alpha * gy + (1f - alpha) * y
+        gz = alpha * gz + (1f - alpha) * z
+
+        val dx = x - gx
+        val dy = y - gy
+        val dz = z - gz
+
+        val motion = sqrt(dx * dx + dy * dy + dz * dz)
         val now = SystemClock.elapsedRealtime()
 
-        if (state == State.WAITING || state == State.ARMING) {
-            if (isFlat && linearAcc < 0.5f) {
-                if (stillStartTime == 0L) stillStartTime = now
-                val elapsed = now - stillStartTime
-                
-                if (elapsed > 500) {
-                    state = State.ARMING
-                    val remaining = ceil((AUTO_ARM_DELAY - elapsed) / 1000.0).toInt()
-                    updateNotification("AUTO-ARMING", "Mengunci dalam $remaining detik...", false)
-                }
-                if (elapsed >= AUTO_ARM_DELAY) {
-                    state = State.ARMED
-                    baseRoll = roll; basePitch = pitch
-                    stillStartTime = 0L; motionScore = 0f
-                    updateNotification("🛡️ SIAGA (ARMED)", "HP diamankan. Jangan diangkat.", false)
-                }
-            } else {
-                stillStartTime = 0L
-                if (state == State.ARMING) {
-                    state = State.WAITING
-                    updateNotification("Mode Siaga", "Menunggu HP diletakkan datar...", false)
-                }
-            }
+        if (motion >= MOTION_THRESHOLD &&
+            now - lastAlarm >= COOLDOWN_MS
+        ) {
+            lastAlarm = now
+            startAlarm()
         }
 
-        if (state == State.ARMED) {
-            val tiltDiff = abs(roll - baseRoll) + abs(pitch - basePitch)
-            if (tiltDiff > TILT_THRESHOLD || linearAcc > MOTION_THRESHOLD) {
-                motionScore += 2.0f
-            } else if (linearAcc > 0.8f) {
-                motionScore += 0.5f
-            } else {
-                motionScore -= 1.0f
-            }
+        // Status berkala untuk mengetahui apakah sensor tetap mengirim data
+        // ketika layar mati. Tidak memperbarui notifikasi pada setiap event.
+        if (now - lastStatusUpdate >= STATUS_UPDATE_MS) {
+            lastStatusUpdate = now
 
-            if (motionScore < 0) motionScore = 0f
-            if (motionScore > SCORE_LIMIT) motionScore = SCORE_LIMIT
-
-            if (motionScore >= SCORE_LIMIT) {
-                triggerTimer()
+            if (!alarmPlaying) {
+                updateNotification(
+                    "Sensor aktif — event diterima: $sensorEventCount"
+                )
             }
         }
     }
 
-    private fun triggerTimer() {
-        state = State.TRIGGERED
-        isTriggered = true
-        
-        // 1. PANGGIL LAYAR MERAH (Memaksa layar menyala & menembus kunci)
-        try {
-            val intent = Intent(this, AlarmActivity::class.java)
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-            startActivity(intent)
-        } catch (e: Exception) {
-            // Abaikan jika gagal
-        }
-
-        // 2. WAKE LOCK CADANGAN (Memaksa layar nyala secara Hardware)
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        @Suppress("DEPRECATION")
-        screenWakeLock = pm.newWakeLock(
-            PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
-            "AntiTheft::ScreenWakeLock"
-        )
-        screenWakeLock?.acquire(10000L)
-
-        // 3. Tampilkan Notifikasi
-        updateNotification("⚠️ PERINGATAN!", "Buka kunci HP dalam 4 detik!", true)
-        
-        // 4. Hitung mundur
-        handler?.postDelayed({ if (isTriggered) triggerAlarm() }, COUNTDOWN_SECONDS)
-    }
-
-    private fun triggerAlarm() {
-        state = State.ALARM
-        updateNotification("🚨 ALARM! 🚨", "HP diambil orang lain! Buka kunci HP untuk mematikan.", true)
-        
-        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        audioManager.setStreamVolume(AudioManager.STREAM_ALARM, audioManager.getStreamMaxVolume(AudioManager.STREAM_ALARM), 0)
-
-        val prefs = getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
-        val savedUriString = prefs.getString("alarm_uri", null)
-        
-        val alarmUri: Uri = if (savedUriString != null) {
-            Uri.parse(savedUriString)
-        } else {
-            RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM) 
-                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
-        }
-
-        val audioAttributes = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_ALARM)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-            .build()
+    private fun startAlarm() {
+        if (alarmPlaying) return
+        alarmPlaying = true
 
         try {
-            mediaPlayer = MediaPlayer().apply {
-                setDataSource(this@TheftService, alarmUri)
-                setAudioAttributes(audioAttributes)
-                isLooping = true
-                prepare()
-                start()
+            val uri = RingtoneManager.getDefaultUri(
+                RingtoneManager.TYPE_ALARM
+            ) ?: RingtoneManager.getDefaultUri(
+                RingtoneManager.TYPE_RINGTONE
+            )
+
+            if (uri != null) {
+                mediaPlayer = MediaPlayer().apply {
+                    setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_ALARM)
+                            .setContentType(
+                                AudioAttributes.CONTENT_TYPE_SONIFICATION
+                            )
+                            .build()
+                    )
+                    setDataSource(this@TheftService, uri)
+                    isLooping = true
+                    prepare()
+                    start()
+                }
+            } else {
+                alarmPlaying = false
             }
         } catch (e: Exception) {
-            val fallbackUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
-            mediaPlayer = MediaPlayer().apply {
-                setDataSource(this@TheftService, fallbackUri)
-                setAudioAttributes(audioAttributes)
-                isLooping = true
-                prepare()
-                start()
+            mediaPlayer?.release()
+            mediaPlayer = null
+            alarmPlaying = false
+        }
+
+        try {
+            val pattern = longArrayOf(0, 500, 200, 500, 200, 700)
+
+            if (Build.VERSION.SDK_INT >= 26) {
+                vibrator?.vibrate(
+                    VibrationEffect.createWaveform(pattern, 0)
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator?.vibrate(pattern, 0)
             }
+        } catch (_: Exception) {
         }
 
-        val vibrator = if (Build.VERSION.SDK_INT >= 31) {
-            (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
-        } else {
-            @Suppress("DEPRECATION") getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-        }
-        if (Build.VERSION.SDK_INT >= 26) {
-            vibrator.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 500, 500), 0))
-        } else {
-            @Suppress("DEPRECATION") vibrator.vibrate(longArrayOf(0, 500, 500), 0)
-        }
-
-        startVolumeWatchdog()
+        updateNotification("GERAKAN TERDETEKSI — ALARM AKTIF")
     }
 
-    private fun startVolumeWatchdog() {
-        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_ALARM)
-        watchdogRunnable = object : Runnable {
-            override fun run() {
-                if (state == State.ALARM) {
-                    if (audioManager.getStreamVolume(AudioManager.STREAM_ALARM) < maxVol) {
-                        audioManager.setStreamVolume(AudioManager.STREAM_ALARM, maxVol, 0)
-                    }
-                    handler?.postDelayed(this, 200)
-                }
+    private fun stopAlarm() {
+        alarmPlaying = false
+
+        try {
+            mediaPlayer?.let {
+                if (it.isPlaying) it.stop()
+                it.release()
             }
+        } catch (_: Exception) {
         }
-        handler?.post(watchdogRunnable!!)
-    }
 
-    private fun stopAlarmAndReset(reason: String) {
-        isTriggered = false; state = State.WAITING
-        motionScore = 0f; stillStartTime = 0L; hasLastData = false
-        gX = 0f; gY = 0f; gZ = 0f
-        
-        mediaPlayer?.stop(); mediaPlayer?.release(); mediaPlayer = null
-        watchdogRunnable?.let { handler?.removeCallbacks(it) }
-        
-        if (screenWakeLock?.isHeld == true) screenWakeLock?.release()
+        mediaPlayer = null
 
-        val vibrator = if (Build.VERSION.SDK_INT >= 31) {
-            (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
-        } else {
-            @Suppress("DEPRECATION") getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        try {
+            vibrator?.cancel()
+        } catch (_: Exception) {
         }
-        vibrator.cancel()
-        updateNotification("Aman", reason, false)
     }
 
-    private fun resetToWaiting() {
-        state = State.WAITING; motionScore = 0f; stillStartTime = 0L; hasLastData = false
-        gX = 0f; gY = 0f; gZ = 0f
-    }
+    private fun stopMonitoring() {
+        monitoring = false
 
-    override fun onDestroy() {
-        super.onDestroy()
-        unregisterReceiver(screenReceiver)
-        sensorManager.unregisterListener(this)
-        mediaPlayer?.release()
-        watchdogRunnable?.let { handler?.removeCallbacks(it) }
-        if (wakeLock?.isHeld == true) wakeLock?.release()
-        if (screenWakeLock?.isHeld == true) screenWakeLock?.release()
-    }
+        try {
+            sensorManager.unregisterListener(this)
+        } catch (_: Exception) {
+        }
 
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+        stopAlarm()
+
+        try {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
+            }
+        } catch (_: Exception) {
+        }
+    }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= 26) {
-            val channel = NotificationChannel("guard_channel", "Anti-Maling Service", NotificationManager.IMPORTANCE_HIGH)
-            channel.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
-        }
-    }
-
-    private fun buildNotification(title: String, text: String, isAlarm: Boolean): Notification {
-        val builder = NotificationCompat.Builder(this, "guard_channel")
-            .setContentTitle(title).setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_lock_lock)
-            .setOngoing(true).setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setCategory(NotificationCompat.CATEGORY_ALARM)
-
-        if (isAlarm) {
-            val fullScreenIntent = Intent(this, MainActivity::class.java)
-            val fullScreenPendingIntent = PendingIntent.getActivity(
-                this, 0, fullScreenIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "Perlindungan Anti-Maling",
+                NotificationManager.IMPORTANCE_LOW
             )
-            builder.setFullScreenIntent(fullScreenPendingIntent, true)
+
+            channel.description =
+                "Status pemantauan gerakan Anti-Maling"
+
+            val manager =
+                getSystemService(Context.NOTIFICATION_SERVICE)
+                    as NotificationManager
+
+            manager.createNotificationChannel(channel)
         }
-
-        return builder.build()
     }
 
-    private fun updateNotification(title: String, text: String, isAlarm: Boolean) {
-        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        notificationManager.notify(1, buildNotification(title, text, isAlarm))
+    private fun buildNotification(message: String): Notification {
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_lock_lock)
+            .setContentTitle("Anti-Maling")
+            .setContentText(message)
+            .setOngoing(true)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
     }
 
-    override fun onBind(intent: Intent?) = null
+    private fun updateNotification(message: String) {
+        val manager =
+            getSystemService(Context.NOTIFICATION_SERVICE)
+                    as NotificationManager
+
+        manager.notify(NOTIFICATION_ID, buildNotification(message))
+    }
+
+    override fun onAccuracyChanged(
+        sensor: Sensor?,
+        accuracy: Int
+    ) {
+    }
+
+    override fun onDestroy() {
+        stopMonitoring()
+        wakeLock = null
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
 }
