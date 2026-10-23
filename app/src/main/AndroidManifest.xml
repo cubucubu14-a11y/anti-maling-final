@@ -7,17 +7,14 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
-    
-    <!-- Izin untuk menembus layar kunci dan menyalakan layar -->
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
-    <uses-permission android:name="android.permission.DISABLE_KEYGUARD" />
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
         android:allowBackup="false"
         android:label="Anti-Maling"
         android:theme="@android:style/Theme.DeviceDefault.DayNight">
-        
+
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -27,10 +24,11 @@
             </intent-filter>
         </activity>
 
-        <!-- AKTIVITAS LAYAR MERAH (Paksa nyala) -->
         <activity
             android:name=".AlarmActivity"
             android:exported="false"
+            android:launchMode="singleTop"
+            android:excludeFromRecents="true"
             android:showWhenLocked="true"
             android:turnScreenOn="true"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
@@ -38,6 +36,7 @@
         <service
             android:name=".TheftService"
             android:exported="false"
+            android:stopWithTask="false"
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
