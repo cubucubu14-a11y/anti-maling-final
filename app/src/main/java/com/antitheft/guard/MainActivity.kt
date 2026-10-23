@@ -2,77 +2,131 @@ package com.antitheft.guard
 
 import android.Manifest
 import android.app.Activity
+import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
+import android.view.Gravity
+import android.view.View
 import android.widget.Button
+import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 
 class MainActivity : Activity() {
+
+    private lateinit var statusText: TextView
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
 
-        if (Build.VERSION.SDK_INT >= 33) {
-            if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 101)
-            }
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(48, 48, 48, 48)
         }
 
-        val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
-        if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
-            intent.data = Uri.parse("package:$packageName")
-            startActivity(intent)
+        statusText = TextView(this).apply {
+            textSize = 16f
+            gravity = Gravity.CENTER
         }
+        root.addView(statusText)
 
-        val btnArm = findViewById<Button>(R.id.btnArm)
-        val btnSelectSound = findViewById<Button>(R.id.btnSelectSound)
-        val tvStatus = findViewById<TextView>(R.id.tvStatus)
+        root.addView(makeButton("AKTIFKAN PERLINDUNGAN") { startProtection() })
+        root.addView(makeButton("MATIKAN PERLINDUNGAN") { stopProtection() })
+        root.addView(makeButton("1. Izinkan Tanpa Batasan Baterai") { requestIgnoreBattery() })
+        root.addView(makeButton("2. Izinkan Layar Penuh (layar kunci)") { requestFullScreen() })
 
-        btnSelectSound.setOnClickListener {
-            val intent = Intent(RingtoneManager.ACTION_RINGTONE_PICKER).apply {
-                putExtra(RingtoneManager.EXTRA_RINGTONE_TYPE, RingtoneManager.TYPE_ALARM)
-                putExtra(RingtoneManager.EXTRA_RINGTONE_TITLE, "Pilih Suara Alarm Anti-Maling")
-                val prefs = getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
-                val currentUri = prefs.getString("alarm_uri", null)
-                if (currentUri != null) {
-                    putExtra(RingtoneManager.EXTRA_RINGTONE_EXISTING_URI, Uri.parse(currentUri))
-                }
-            }
-            startActivityForResult(intent, 999)
-        }
+        setContentView(root)
 
-        btnArm.setOnClickListener {
-            val intent = Intent(this, TheftService::class.java).setAction("START")
-            if (Build.VERSION.SDK_INT >= 26) {
-                startForegroundService(intent)
-            } else {
-                startService(intent)
-            }
-            tvStatus.text = "Status: MENUNGGU DATAR..."
-            btnArm.text = "JANGAN TUTUP APLIKASI"
-            btnArm.isEnabled = false
-            moveTaskToBack(true)
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 100)
         }
     }
 
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == 999 && resultCode == Activity.RESULT_OK) {
-            val uri: Uri? = data?.getParcelableExtra(RingtoneManager.EXTRA_RINGTONE_PICKED_URI)
-            if (uri != null) {
-                getSharedPreferences("app_prefs", Context.MODE_PRIVATE).edit().putString("alarm_uri", uri.toString()).apply()
-                Toast.makeText(this, "Suara alarm disimpan!", Toast.LENGTH_SHORT).show()
-            } else {
-                getSharedPreferences("app_prefs", Context.MODE_PRIVATE).edit().remove("alarm_uri").apply()
-            }
+    override fun onResume() {
+        super.onResume()
+        refreshStatus()
+    }
+
+    private fun makeButton(label: String, onClick: () -> Unit): Button {
+        return Button(this).apply {
+            text = label
+            setOnClickListener { onClick() }
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = 24 }
         }
+    }
+
+    private fun startProtection() {
+        val intent = Intent(this, TheftService::class.java).apply {
+            action = TheftService.ACTION_START
+        }
+        if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent) else startService(intent)
+        Toast.makeText(this, "Perlindungan diaktifkan", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun stopProtection() {
+        val intent = Intent(this, TheftService::class.java).apply {
+            action = TheftService.ACTION_STOP
+        }
+        startService(intent)
+        Toast.makeText(this, "Perlindungan dimatikan", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun requestIgnoreBattery() {
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (pm.isIgnoringBatteryOptimizations(packageName)) {
+            Toast.makeText(this, "Sudah diizinkan", Toast.LENGTH_SHORT).show()
+            return
+        }
+        try {
+            startActivity(
+                Intent(
+                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:$packageName")
+                )
+            )
+        } catch (e: Exception) {
+            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        }
+    }
+
+    private fun requestFullScreen() {
+        if (Build.VERSION.SDK_INT >= 34) {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            if (nm.canUseFullScreenIntent()) {
+                Toast.makeText(this, "Sudah diizinkan", Toast.LENGTH_SHORT).show()
+                return
+            }
+            try {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT,
+                        Uri.parse("package:$packageName")
+                    )
+                )
+            } catch (_: Exception) {}
+        } else {
+            Toast.makeText(this, "Tidak perlu di versi Android ini", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun refreshStatus() {
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val battery = if (pm.isIgnoringBatteryOptimizations(packageName)) "OK" else "BELUM"
+        statusText.text = "Izin baterai: $battery\n\n" +
+                "Tekan AKTIFKAN, lalu kunci HP dan coba gerakkan."
+        statusText.visibility = View.VISIBLE
     }
 }
