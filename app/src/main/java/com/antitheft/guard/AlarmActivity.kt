@@ -12,9 +12,9 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 
 class AlarmActivity : Activity() {
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -25,7 +25,7 @@ class AlarmActivity : Activity() {
             @Suppress("DEPRECATION")
             window.addFlags(
                 WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
-                        WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                    WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
             )
         }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -34,31 +34,35 @@ class AlarmActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
             setBackgroundColor(Color.RED)
-            setPadding(48, 48, 48, 48)
+            setPadding(36, 36, 36, 36)
         }
-
         root.addView(TextView(this).apply {
-            text = "PERINGATAN!\nHP ini sedang dipindahkan"
-            textSize = 28f
+            text = "PERINGATAN!\\nGERAKAN HP TERDETEKSI"
+            textSize = 27f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
         })
-
         root.addView(Button(this).apply {
-            text = "MATIKAN ALARM (perlu buka kunci)"
-            setOnClickListener { unlockThenDismiss() }
+            text = "MATIKAN ALARM"
+            setOnClickListener { requestUnlockAndDismiss() }
         })
-
         setContentView(root)
     }
 
-    private fun unlockThenDismiss() {
-        val km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-
-        if (Build.VERSION.SDK_INT >= 26 && km.isKeyguardLocked) {
-            km.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
+    private fun requestUnlockAndDismiss() {
+        val keyguard = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+        if (Build.VERSION.SDK_INT >= 26 && keyguard.isKeyguardLocked) {
+            keyguard.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
                 override fun onDismissSucceeded() {
                     dismissAlarm()
+                }
+
+                override fun onDismissCancelled() {
+                    Toast.makeText(this@AlarmActivity, "Buka kunci HP untuk mematikan alarm", Toast.LENGTH_SHORT).show()
+                }
+
+                override fun onDismissError() {
+                    Toast.makeText(this@AlarmActivity, "Tidak bisa membuka kunci. Coba lagi.", Toast.LENGTH_SHORT).show()
                 }
             })
         } else {
@@ -67,9 +71,7 @@ class AlarmActivity : Activity() {
     }
 
     private fun dismissAlarm() {
-        startService(Intent(this, TheftService::class.java).apply {
-            action = TheftService.ACTION_DISMISS
-        })
+        startService(Intent(this, TheftService::class.java).setAction(TheftService.ACTION_DISMISS))
         finish()
     }
 }
