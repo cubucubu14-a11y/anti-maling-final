@@ -40,7 +40,7 @@
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="anti_theft_sensor" />
+                android:value="anti_theft_motion_sensor" />
         </service>
     </application>
 </manifest>
