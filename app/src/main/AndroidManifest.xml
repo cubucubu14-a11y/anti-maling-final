@@ -1,3 +1,4 @@
+
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
@@ -35,12 +36,16 @@
 
         <service
             android:name=".TheftService"
+            android:enabled="true"
             android:exported="false"
             android:stopWithTask="false"
             android:foregroundServiceType="specialUse">
+
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="anti_theft_motion_sensor" />
+                android:value="Motion-based anti-theft monitoring while protection is enabled" />
+
         </service>
+
     </application>
 </manifest>
