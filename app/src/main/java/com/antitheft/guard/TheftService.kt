@@ -1,4 +1,3 @@
-
 package com.antitheft.guard
 
 import android.app.Notification
@@ -13,673 +12,210 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.hardware.TriggerEvent
+import android.hardware.TriggerEventListener
 import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.MediaPlayer
 import android.media.RingtoneManager
-import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
-import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlin.math.sqrt
 
 class TheftService : Service(), SensorEventListener {
 
     companion object {
-        const val ACTION_START =
-            "com.antitheft.guard.START"
-        const val ACTION_STOP =
-            "com.antitheft.guard.STOP"
-        const val ACTION_DISMISS =
-            "com.antitheft.guard.DISMISS"
+        const val ACTION_START = "com.antitheft.guard.START"
+        const val ACTION_STOP = "com.antitheft.guard.STOP"
+        const val ACTION_DISMISS = "com.antitheft.guard.DISMISS"
 
-        private const val TAG = "TheftService"
-
-        private const val CHANNEL_ID =
-            "anti_theft_channel"
-        private const val ALARM_CHANNEL_ID =
-            "anti_theft_alarm_channel"
-
+        private const val CHANNEL_ID = "anti_theft_channel"
+        private const val ALARM_CHANNEL_ID = "anti_theft_alarm_channel"
         private const val NOTIFICATION_ID = 2001
         private const val ALARM_NOTIFICATION_ID = 2002
 
-        private const val PREFS = "anti_theft_prefs"
-        private const val KEY_SENSITIVITY = "sensitivity"
-        private const val KEY_ALARM_URI = "alarm_uri"
-
-        private const val WAKELOCK_TIMEOUT =
-            12L * 60L * 60L * 1000L
-
+        private const val MOTION_THRESHOLD = 1.5f
         private const val COOLDOWN_MS = 2500L
+        private const val STATUS_UPDATE_MS = 15000L
+        private const val BASELINE_RESET_MS = 5000L
     }
 
     private lateinit var sensorManager: SensorManager
-
-    private var motionSensor: Sensor? = null
-    private var linearSensorInUse = false
-
+    private var accelerometer: Sensor? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var mediaPlayer: MediaPlayer? = null
     private var vibrator: Vibrator? = null
 
-    @Volatile
-    private var isArmed = false
+    private var monitoring = false
+    private var alarmPlaying = false
+    private var gravityInitialized = false
+    private var usingWakeUpSensor = false
+
+    private var sensorThread: HandlerThread? = null
+    private var sensorHandler: Handler? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var significantMotion: Sensor? = null
 
     @Volatile
-    private var isAlarmActive = false
+    private var lastEventTime = 0L
 
-    private var lastTriggerAt = 0L
-    private var baselineInitialized = false
+    private val triggerListener = object : TriggerEventListener() {
+        override fun onTrigger(event: TriggerEvent?) {
+            if (!monitoring) return
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastAlarm >= COOLDOWN_MS) {
+                lastAlarm = now
+                mainHandler.post { startAlarm() }
+            }
+            armTrigger()
+        }
+    }
 
-    private var gravityX = 0f
-    private var gravityY = 0f
-    private var gravityZ = 0f
+    private val watchdog = object : Runnable {
+        override fun run() {
+            if (!monitoring) return
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastEventTime > 10_000L) {
+                registerAccelerometer()
+            }
+            mainHandler.postDelayed(this, 10_000L)
+        }
+    }
+
+    private var gx = 0f
+    private var gy = 0f
+    private var gz = 0f
+
+    private var lastAlarm = 0L
+    private var lastBaselineReset = 0L
+    private var lastStatusUpdate = 0L
+    private var sensorEventCount = 0L
 
     override fun onCreate() {
         super.onCreate()
 
-        createNotificationChannels()
+        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
 
-        sensorManager = getSystemService(
-            Context.SENSOR_SERVICE
-        ) as SensorManager
+        val wakeUpSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER, true)
+        usingWakeUpSensor = wakeUpSensor != null
+        accelerometer = wakeUpSensor
+            ?: sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
 
-        val pm = getSystemService(
-            Context.POWER_SERVICE
-        ) as PowerManager
+        significantMotion =
+            sensorManager.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION, true)
+                ?: sensorManager.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION)
 
+        sensorThread = HandlerThread("antitheft-sensor").also { it.start() }
+        sensorHandler = Handler(sensorThread!!.looper)
+
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK,
-            "$TAG:SensorWakeLock"
-        ).apply {
-            setReferenceCounted(false)
-        }
+            "$packageName:AntiTheftMotion"
+        ).apply { setReferenceCounted(false) }
 
         vibrator = if (Build.VERSION.SDK_INT >= 31) {
-            val vm = getSystemService(
-                Context.VIBRATOR_MANAGER_SERVICE
-            ) as VibratorManager
-            vm.defaultVibrator
+            (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
         } else {
             @Suppress("DEPRECATION")
-            getSystemService(
-                Context.VIBRATOR_SERVICE
-            ) as Vibrator
+            getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
         }
 
-        selectMotionSensor()
-
-        Log.i(
-            TAG,
-            "Created; sensor=${motionSensor?.name}; " +
-                "type=${motionSensor?.type}; " +
-                "wakeUp=${motionSensor?.isWakeUpSensor}"
-        )
+        createNotificationChannels()
     }
 
-    private fun selectMotionSensor() {
-        val wakeAccelerometer =
-            sensorManager.getDefaultSensor(
-                Sensor.TYPE_ACCELEROMETER,
-                true
-            )
-
-        val wakeLinear =
-            sensorManager.getDefaultSensor(
-                Sensor.TYPE_LINEAR_ACCELERATION,
-                true
-            )
-
-        val normalAccelerometer =
-            sensorManager.getDefaultSensor(
-                Sensor.TYPE_ACCELEROMETER
-            )
-
-        val normalLinear =
-            sensorManager.getDefaultSensor(
-                Sensor.TYPE_LINEAR_ACCELERATION
-            )
-
-        // Accelerometer diprioritaskan karena tersedia
-        // pada sebagian besar perangkat Android.
-        motionSensor = wakeAccelerometer
-            ?: wakeLinear
-            ?: normalAccelerometer
-            ?: normalLinear
-
-        linearSensorInUse =
-            motionSensor?.type ==
-                Sensor.TYPE_LINEAR_ACCELERATION
-
-        if (motionSensor == null) {
-            Log.e(TAG, "No motion sensor available")
-        }
-    }
-
-    override fun onStartCommand(
-        intent: Intent?,
-        flags: Int,
-        startId: Int
-    ): Int {
-
-        Log.i(
-            TAG,
-            "onStartCommand action=${intent?.action}"
-        )
-
-        // Foreground wajib dimulai sebelum pemantauan.
-        try {
-            startForegroundCompat(
-                buildStatusNotification(
-                    "Menyiapkan perlindungan..."
-                )
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "startForeground failed", e)
-            stopSelf(startId)
-            return START_NOT_STICKY
-        }
-
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
-                stopProtection()
+                stopMonitoring()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
                 return START_NOT_STICKY
             }
 
             ACTION_DISMISS -> {
-                if (!isArmed) {
-                    Log.w(
-                        TAG,
-                        "Dismiss ignored: not armed"
-                    )
-                    stopForegroundCompat(false)
-                    return START_NOT_STICKY
-                }
-
-                stopAlarmOnly()
-                ensureProtectionRunning()
+                stopAlarm()
+                lastAlarm = SystemClock.elapsedRealtime()
+                if (monitoring) updateNotification("Pemantauan aktif")
                 return START_STICKY
             }
 
-            else -> {
-                isArmed = true
-                ensureProtectionRunning()
-            }
+            else -> startMonitoring()
         }
 
         return START_STICKY
     }
 
-    private fun ensureProtectionRunning() {
-        if (!isArmed) return
+    private fun startMonitoring() {
+        startForegroundCompat(buildNotification("Menyiapkan sensor gerakan..."))
 
-        acquireWakeLock()
+        if (monitoring) return
 
-        val sensor = motionSensor
-
-        if (sensor == null) {
-            updateNotification(
-                "ERROR: Sensor gerak tidak tersedia"
-            )
+        if (accelerometer == null) {
+            updateNotification("Sensor akselerometer tidak tersedia")
+            stopSelf()
             return
         }
 
         try {
-            sensorManager.unregisterListener(this)
-            baselineInitialized = false
+            if (wakeLock?.isHeld != true) wakeLock?.acquire()
 
-            val registered = sensorManager.registerListener(
-                this,
-                sensor,
-                SensorManager.SENSOR_DELAY_GAME
-            )
+            gravityInitialized = false
+            sensorEventCount = 0L
+            lastAlarm = 0L
+            lastStatusUpdate = 0L
+            lastBaselineReset = SystemClock.elapsedRealtime()
 
-            Log.i(
-                TAG,
-                "registerListener=$registered; " +
-                    "sensor=${sensor.name}; " +
-                    "wakeUp=${sensor.isWakeUpSensor}"
-            )
+            monitoring = registerAccelerometer()
+            lastEventTime = SystemClock.elapsedRealtime()
 
-            updateNotification(
-                if (registered) {
-                    if (sensor.isWakeUpSensor) {
-                        "Aktif — sensor wake-up terdaftar"
-                    } else {
-                        "Aktif — sensor biasa terdaftar"
-                    }
-                } else {
-                    "ERROR: Sensor gagal didaftarkan"
-                }
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "Sensor registration error", e)
-            updateNotification(
-                "ERROR: Gagal mendaftarkan sensor"
-            )
-        }
-    }
-
-    private fun acquireWakeLock() {
-        try {
-            val lock = wakeLock ?: return
-
-            if (!lock.isHeld) {
-                lock.acquire(WAKELOCK_TIMEOUT)
-            }
-
-            Log.i(TAG, "WakeLock held=${lock.isHeld}")
-        } catch (e: Exception) {
-            Log.e(TAG, "WakeLock failed", e)
-            updateNotification(
-                "PERINGATAN: WakeLock gagal"
-            )
-        }
-    }
-
-    override fun onSensorChanged(event: SensorEvent) {
-        if (!isArmed || isAlarmActive) return
-        if (event.values.size < 3) return
-
-        val now = System.currentTimeMillis()
-
-        if (now - lastTriggerAt < COOLDOWN_MS) return
-
-        val magnitude: Float
-
-        if (linearSensorInUse) {
-            val x = event.values[0]
-            val y = event.values[1]
-            val z = event.values[2]
-
-            magnitude = sqrt(x * x + y * y + z * z)
-        } else {
-            val alpha = 0.80f
-
-            if (!baselineInitialized) {
-                gravityX = event.values[0]
-                gravityY = event.values[1]
-                gravityZ = event.values[2]
-                baselineInitialized = true
-                return
-            }
-
-            gravityX =
-                alpha * gravityX +
-                    (1f - alpha) * event.values[0]
-
-            gravityY =
-                alpha * gravityY +
-                    (1f - alpha) * event.values[1]
-
-            gravityZ =
-                alpha * gravityZ +
-                    (1f - alpha) * event.values[2]
-
-            val x = event.values[0] - gravityX
-            val y = event.values[1] - gravityY
-            val z = event.values[2] - gravityZ
-
-            magnitude = sqrt(x * x + y * y + z * z)
-        }
-
-        val sensitivity = getSharedPreferences(
-            PREFS,
-            Context.MODE_PRIVATE
-        ).getInt(
-            KEY_SENSITIVITY,
-            5
-        ).coerceIn(1, 10)
-
-        val threshold =
-            3.2f - ((sensitivity - 1) * (2.45f / 9f))
-
-        if (magnitude >= threshold) {
-            lastTriggerAt = now
-
-            Log.w(
-                TAG,
-                "MOTION DETECTED: magnitude=$magnitude " +
-                    "threshold=$threshold"
-            )
-
-            triggerAlarm()
-        }
-    }
-
-    override fun onAccuracyChanged(
-        sensor: Sensor?,
-        accuracy: Int
-    ) = Unit
-
-    private fun triggerAlarm() {
-        if (!isArmed || isAlarmActive) return
-
-        isAlarmActive = true
-
-        Log.w(TAG, "ALARM TRIGGERED")
-
-        try {
-            val audioManager = getSystemService(
-                Context.AUDIO_SERVICE
-            ) as AudioManager
-
-            audioManager.setStreamVolume(
-                AudioManager.STREAM_ALARM,
-                audioManager.getStreamMaxVolume(
-                    AudioManager.STREAM_ALARM
-                ),
-                0
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "Set alarm volume failed", e)
-        }
-
-        playAlarmSound()
-        startVibration()
-        showAlarmNotification()
-
-        updateNotification(
-            "ALARM AKTIF — gerakan terdeteksi"
-        )
-    }
-
-    private fun playAlarmSound() {
-        releaseMediaPlayer()
-
-        val selectedUri = try {
-            getSharedPreferences(
-                PREFS,
-                Context.MODE_PRIVATE
-            ).getString(
-                KEY_ALARM_URI,
-                null
-            )?.let {
-                Uri.parse(it)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Invalid selected audio URI", e)
-            null
-        }
-
-        val fallbackUri =
-            RingtoneManager.getDefaultUri(
-                RingtoneManager.TYPE_ALARM
-            ) ?: RingtoneManager.getDefaultUri(
-                RingtoneManager.TYPE_RINGTONE
-            )
-
-        val candidates = listOfNotNull(
-            selectedUri,
-            fallbackUri
-        ).distinct()
-
-        for (uri in candidates) {
-            try {
-                val player = MediaPlayer()
-
-                player.setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(
-                            AudioAttributes.USAGE_ALARM
-                        )
-                        .setContentType(
-                            AudioAttributes.CONTENT_TYPE_SONIFICATION
-                        )
-                        .build()
-                )
-
-                player.setDataSource(this, uri)
-                player.isLooping = true
-                player.prepare()
-                player.start()
-
-                mediaPlayer = player
-
-                Log.i(TAG, "Alarm audio started: $uri")
-                return
-            } catch (e: Exception) {
-                Log.e(TAG, "Audio playback failed: $uri", e)
-                releaseMediaPlayer()
-            }
-        }
-
-        Log.e(TAG, "No alarm audio source could be played")
-    }
-
-    private fun startVibration() {
-        try {
-            val pattern = longArrayOf(0, 500, 200, 500)
-
-            if (Build.VERSION.SDK_INT >= 26) {
-                vibrator?.vibrate(
-                    VibrationEffect.createWaveform(
-                        pattern,
-                        0
-                    )
-                )
+            if (monitoring) {
+                armTrigger()
+                mainHandler.removeCallbacks(watchdog)
+                mainHandler.postDelayed(watchdog, 10_000L)
+                val mode = if (usingWakeUpSensor) "wake-up" else "biasa"
+                updateNotification("Pemantauan aktif (sensor $mode)")
             } else {
-                @Suppress("DEPRECATION")
-                vibrator?.vibrate(pattern, 0)
-            }
-
-            Log.i(TAG, "Vibration started")
-        } catch (e: Exception) {
-            Log.e(TAG, "Vibration failed", e)
-        }
-    }
-
-    private fun releaseMediaPlayer() {
-        val player = mediaPlayer
-        mediaPlayer = null
-
-        try {
-            player?.let {
-                if (it.isPlaying) {
-                    it.stop()
-                }
-                it.release()
+                updateNotification("Gagal mendaftarkan sensor")
+                stopMonitoring()
+                stopSelf()
             }
         } catch (e: Exception) {
-            Log.e(TAG, "MediaPlayer release failed", e)
+            updateNotification("Gagal memulai sensor: ${e.javaClass.simpleName}")
+            stopMonitoring()
+            stopSelf()
         }
     }
 
-    private fun stopAlarmOnly() {
-        isAlarmActive = false
-
-        releaseMediaPlayer()
-
-        try {
-            vibrator?.cancel()
-        } catch (e: Exception) {
-            Log.e(TAG, "Vibrator cancel failed", e)
-        }
-
-        try {
-            val manager = getSystemService(
-                Context.NOTIFICATION_SERVICE
-            ) as NotificationManager
-
-            manager.cancel(ALARM_NOTIFICATION_ID)
-        } catch (e: Exception) {
-            Log.e(
-                TAG,
-                "Cancel alarm notification failed",
-                e
-            )
-        }
-    }
-
-    private fun stopProtection() {
-        isArmed = false
-
-        try {
-            sensorManager.unregisterListener(this)
-        } catch (e: Exception) {
-            Log.e(TAG, "Unregister sensor failed", e)
-        }
-
-        stopAlarmOnly()
-
-        try {
-            wakeLock?.let {
-                if (it.isHeld) it.release()
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Release WakeLock failed", e)
-        }
-
-        try {
-            val manager = getSystemService(
-                Context.NOTIFICATION_SERVICE
-            ) as NotificationManager
-
-            manager.cancel(NOTIFICATION_ID)
-            manager.cancel(ALARM_NOTIFICATION_ID)
-        } catch (e: Exception) {
-            Log.e(TAG, "Notification cleanup failed", e)
-        }
-
-        stopForegroundCompat(true)
-        stopSelf()
-    }
-
-    private fun showAlarmNotification() {
-        try {
-            val alarmIntent = Intent(
-                this,
-                AlarmActivity::class.java
-            ).apply {
-                addFlags(
-                    Intent.FLAG_ACTIVITY_NEW_TASK or
-                        Intent.FLAG_ACTIVITY_CLEAR_TOP
-                )
-            }
-
-            val pendingIntent = PendingIntent.getActivity(
-                this,
-                12,
-                alarmIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT or
-                    PendingIntent.FLAG_IMMUTABLE
-            )
-
-            val notification = NotificationCompat.Builder(
-                this,
-                ALARM_CHANNEL_ID
-            )
-                .setSmallIcon(
-                    android.R.drawable.ic_lock_lock
-                )
-                .setContentTitle("ALARM ANTI-MALING")
-                .setContentText(
-                    "Gerakan terdeteksi. Ketuk untuk mengontrol alarm."
-                )
-                .setCategory(
-                    NotificationCompat.CATEGORY_ALARM
-                )
-                .setPriority(
-                    NotificationCompat.PRIORITY_MAX
-                )
-                .setVisibility(
-                    NotificationCompat.VISIBILITY_PUBLIC
-                )
-                .setOngoing(true)
-                .setContentIntent(pendingIntent)
-                .setFullScreenIntent(
-                    pendingIntent,
-                    true
-                )
-                .build()
-
-            val manager = getSystemService(
-                Context.NOTIFICATION_SERVICE
-            ) as NotificationManager
-
-            manager.notify(
-                ALARM_NOTIFICATION_ID,
-                notification
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "Show alarm notification failed", e)
-        }
-    }
-
-    private fun createNotificationChannels() {
-        if (Build.VERSION.SDK_INT < 26) return
-
-        val manager = getSystemService(
-            Context.NOTIFICATION_SERVICE
-        ) as NotificationManager
-
-        manager.createNotificationChannel(
-            NotificationChannel(
-                CHANNEL_ID,
-                "Status Anti-Maling",
-                NotificationManager.IMPORTANCE_LOW
-            )
-        )
-
-        manager.createNotificationChannel(
-            NotificationChannel(
-                ALARM_CHANNEL_ID,
-                "Alarm Anti-Maling",
-                NotificationManager.IMPORTANCE_HIGH
-            ).apply {
-                lockscreenVisibility =
-                    Notification.VISIBILITY_PUBLIC
-
-                setSound(null, null)
-            }
-        )
-    }
-
-    private fun buildStatusNotification(
-        message: String
-    ): Notification {
-        return NotificationCompat.Builder(
+    private fun registerAccelerometer(): Boolean {
+        sensorManager.unregisterListener(this)
+        return sensorManager.registerListener(
             this,
-            CHANNEL_ID
+            accelerometer,
+            SensorManager.SENSOR_DELAY_GAME,
+            0,
+            sensorHandler
         )
-            .setSmallIcon(
-                android.R.drawable.ic_lock_lock
-            )
-            .setContentTitle("Anti-Maling")
-            .setContentText(message)
-            .setOngoing(true)
-            .setCategory(
-                NotificationCompat.CATEGORY_SERVICE
-            )
-            .setPriority(
-                NotificationCompat.PRIORITY_LOW
-            )
-            .build()
     }
 
-    private fun updateNotification(message: String) {
+    private fun armTrigger() {
+        val sensor = significantMotion ?: return
         try {
-            val manager = getSystemService(
-                Context.NOTIFICATION_SERVICE
-            ) as NotificationManager
-
-            manager.notify(
-                NOTIFICATION_ID,
-                buildStatusNotification(message)
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "Update notification failed", e)
+            sensorManager.requestTriggerSensor(triggerListener, sensor)
+        } catch (_: Exception) {
         }
     }
 
-    private fun startForegroundCompat(
-        notification: Notification
-    ) {
+    private fun startForegroundCompat(notification: Notification) {
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(
                 NOTIFICATION_ID,
@@ -687,57 +223,251 @@ class TheftService : Service(), SensorEventListener {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
             )
         } else {
-            startForeground(
-                NOTIFICATION_ID,
-                notification
-            )
+            startForeground(NOTIFICATION_ID, notification)
         }
     }
 
-    private fun stopForegroundCompat(remove: Boolean) {
-        if (Build.VERSION.SDK_INT >= 24) {
-            stopForeground(
-                if (remove) {
-                    STOP_FOREGROUND_REMOVE
-                } else {
-                    STOP_FOREGROUND_DETACH
+    override fun onSensorChanged(event: SensorEvent) {
+        if (!monitoring || event.sensor.type != Sensor.TYPE_ACCELEROMETER) return
+
+        sensorEventCount++
+        lastEventTime = SystemClock.elapsedRealtime()
+
+        val x = event.values[0]
+        val y = event.values[1]
+        val z = event.values[2]
+
+        if (!gravityInitialized) {
+            gx = x; gy = y; gz = z
+            gravityInitialized = true
+            return
+        }
+
+        val alpha = 0.8f
+        gx = alpha * gx + (1f - alpha) * x
+        gy = alpha * gy + (1f - alpha) * y
+        gz = alpha * gz + (1f - alpha) * z
+
+        val dx = x - gx
+        val dy = y - gy
+        val dz = z - gz
+        val motion = sqrt(dx * dx + dy * dy + dz * dz)
+        val now = SystemClock.elapsedRealtime()
+
+        if (motion >= MOTION_THRESHOLD && now - lastAlarm >= COOLDOWN_MS) {
+            lastAlarm = now
+            mainHandler.post { startAlarm() }
+        }
+
+        // Reset baseline gravitasi kalau device diam cukup lama.
+        if (motion < 0.4f && now - lastAlarm > BASELINE_RESET_MS) {
+            gx = 0.95f * gx + 0.05f * x
+            gy = 0.95f * gy + 0.05f * y
+            gz = 0.95f * gz + 0.05f * z
+        }
+
+        if (now - lastStatusUpdate >= STATUS_UPDATE_MS && !alarmPlaying) {
+            lastStatusUpdate = now
+            updateNotification("Sensor aktif - event: $sensorEventCount")
+        }
+    }
+
+    private fun startAlarm() {
+        if (alarmPlaying || !monitoring) return
+        alarmPlaying = true
+
+        try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            am.setStreamVolume(
+                AudioManager.STREAM_ALARM,
+                am.getStreamMaxVolume(AudioManager.STREAM_ALARM),
+                0
+            )
+        } catch (_: Exception) {
+        }
+
+        try {
+            val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+            if (uri != null) {
+                mediaPlayer = MediaPlayer().apply {
+                    setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_ALARM)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                            .build()
+                    )
+                    setWakeMode(this@TheftService, PowerManager.PARTIAL_WAKE_LOCK)
+                    setDataSource(this@TheftService, uri)
+                    isLooping = true
+                    prepare()
+                    start()
                 }
+            }
+        } catch (_: Exception) {
+            mediaPlayer?.release()
+            mediaPlayer = null
+        }
+
+        try {
+            val pattern = longArrayOf(0, 500, 200, 500, 200, 700)
+            if (Build.VERSION.SDK_INT >= 26) {
+                vibrator?.vibrate(VibrationEffect.createWaveform(pattern, 0))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator?.vibrate(pattern, 0)
+            }
+        } catch (_: Exception) {
+        }
+
+        showAlarmScreen()
+        updateNotification("GERAKAN TERDETEKSI - ALARM AKTIF")
+    }
+
+    private fun showAlarmScreen() {
+        try {
+            val intent = Intent(this, AlarmActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            }
+            val pi = PendingIntent.getActivity(
+                this,
+                0,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
-        } else {
-            @Suppress("DEPRECATION")
-            stopForeground(remove)
+
+            val dismissIntent = Intent(this, TheftService::class.java).apply {
+                action = ACTION_DISMISS
+            }
+            val dismissPi = PendingIntent.getService(
+                this,
+                1,
+                dismissIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            val notification = NotificationCompat.Builder(this, ALARM_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.ic_lock_lock)
+                .setContentTitle("ALARM ANTI-MALING")
+                .setContentText("Gerakan terdeteksi! Ketuk untuk mematikan.")
+                .setPriority(NotificationCompat.PRIORITY_MAX)
+                .setCategory(NotificationCompat.CATEGORY_ALARM)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setOngoing(true)
+                .setContentIntent(pi)
+                .setFullScreenIntent(pi, true)
+                .addAction(0, "MATIKAN ALARM", dismissPi)
+                .build()
+
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.notify(ALARM_NOTIFICATION_ID, notification)
+        } catch (_: Exception) {
         }
     }
 
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        Log.w(
-            TAG,
-            "App task removed; armed=$isArmed"
-        )
-        super.onTaskRemoved(rootIntent)
+    private fun stopAlarm() {
+        alarmPlaying = false
+
+        try {
+            mediaPlayer?.let {
+                if (it.isPlaying) it.stop()
+                it.release()
+            }
+        } catch (_: Exception) {
+        }
+        mediaPlayer = null
+
+        try {
+            vibrator?.cancel()
+        } catch (_: Exception) {
+        }
+
+        try {
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.cancel(ALARM_NOTIFICATION_ID)
+        } catch (_: Exception) {
+        }
+
+        // Tutup AlarmActivity kalau sedang terbuka.
+        try {
+            sendBroadcast(Intent(AlarmActivity.ACTION_ALARM_STOPPED))
+        } catch (_: Exception) {
+        }
     }
 
-    override fun onDestroy() {
-        Log.w(TAG, "Service destroyed")
+    private fun stopMonitoring() {
+        monitoring = false
 
-        isArmed = false
+        mainHandler.removeCallbacks(watchdog)
 
         try {
             sensorManager.unregisterListener(this)
-        } catch (e: Exception) {
-            Log.e(TAG, "Cleanup sensor failed", e)
+        } catch (_: Exception) {
         }
-
-        stopAlarmOnly()
 
         try {
-            wakeLock?.let {
-                if (it.isHeld) it.release()
+            significantMotion?.let {
+                sensorManager.cancelTriggerSensor(triggerListener, it)
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Cleanup WakeLock failed", e)
+        } catch (_: Exception) {
         }
 
+        stopAlarm()
+
+        try {
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun createNotificationChannels() {
+        if (Build.VERSION.SDK_INT >= 26) {
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+            val status = NotificationChannel(
+                CHANNEL_ID,
+                "Perlindungan Anti-Maling",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply { description = "Status pemantauan gerakan" }
+
+            val alarm = NotificationChannel(
+                ALARM_CHANNEL_ID,
+                "Alarm Anti-Maling",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Peringatan saat gerakan terdeteksi"
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                setSound(null, null)
+                enableVibration(false)
+            }
+
+            manager.createNotificationChannel(status)
+            manager.createNotificationChannel(alarm)
+        }
+    }
+
+    private fun buildNotification(message: String): Notification {
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_lock_lock)
+            .setContentTitle("Anti-Maling")
+            .setContentText(message)
+            .setOngoing(true)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+    }
+
+    private fun updateNotification(message: String) {
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.notify(NOTIFICATION_ID, buildNotification(message))
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+
+    override fun onDestroy() {
+        stopMonitoring()
+        sensorThread?.quitSafely()
+        wakeLock = null
         super.onDestroy()
     }
 
